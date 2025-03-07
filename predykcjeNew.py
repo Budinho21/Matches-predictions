@@ -208,18 +208,25 @@ def predict_over_2_5(model, upcoming_matches, le):
     X = upcoming_matches[["Home Team", "Away Team", "Average Goals"]]
 
     # Przewidywanie na podstawie modelu
-    predictions = model.predict(X)
+    predictions_proba = model.predict_proba(X)
+
+    # Prawdopodobieństwa dla klasy 1 (Over 2.5)
+    upcoming_matches["Prediction Over 2.5"] = predictions_proba[:, 1] * 100  # Zamiana na procent
+
+    # Zaokrąglamy do 2 miejsc po przecinku
+    upcoming_matches["Prediction Over 2.5"] = upcoming_matches["Prediction Over 2.5"].round(2).astype(str) + "%"  # Formatowanie jako procent
 
     # Przywrócenie nazw drużyn w nadchodzących meczach
     upcoming_matches["Home Team"] = le.inverse_transform(upcoming_matches["Home Team"])
     upcoming_matches["Away Team"] = le.inverse_transform(upcoming_matches["Away Team"])
 
-    # Dodajemy przewidywania do dataframe
-    upcoming_matches["Prediction Over 2.5"] = predictions
+    # Dodanie kolumny z kursem minimalnym
+    upcoming_matches["Minimum Odd"] = (1 / (predictions_proba[:, 1] * 0.88)) + 0.01
+    upcoming_matches["Minimum Odd"] = upcoming_matches["Minimum Odd"].round(2)
 
-    # Zapisujemy wyniki przewidywania do tego samego pliku
+    # Zapisujemy wyniki do pliku CSV
     upcoming_matches.to_csv("predictions.csv", index=False)
-    print("Plik predictions.csv zapisany.")
+    print("Plik predictions.csv zapisany z przewidywaniami szansy na Over 2.5.")
 
     return upcoming_matches
 
