@@ -8,6 +8,7 @@ from sklearn.preprocessing import LabelEncoder
 import time
 from datetime import datetime, timedelta
 
+
 # --- 1. POBIERANIE DANYCH HISTORYCZNYCH ---
 def fetch_historical_data():
     print("Pobieranie danych historycznych...")
@@ -66,6 +67,7 @@ def fetch_historical_data():
 # --- 2. PRZETWARZANIE DANYCH ---
 def prepare_features(df, le=None):
     print("Przygotowywanie cech...")
+
     if le is None:
         le = LabelEncoder()
         df["Home Team"] = le.fit_transform(df["Home Team"])
@@ -75,13 +77,28 @@ def prepare_features(df, le=None):
         df["Away Team"] = le.transform(df["Away Team"])
 
     # Sprawdzamy dostępność kolumny 'Average Goals' w danych
-    if 'Average Goals' not in df.columns:
-        print("Kolumna 'Average Goals' nie istnieje. Obliczamy średnią bramek na podstawie 'Total Goals'...")
-        df["Average Goals"] = df["Total Goals"].rolling(window=5).mean().fillna(2.5)
+    if 'Average Goals (5)' not in df.columns or 'Average Goals (30)' not in df.columns:
+        print("Kolumna 'Average Goals (5)' lub 'Average Goals (30)' nie istnieje. Obliczamy średnią bramek...")
+
+        # Obliczamy średnią bramek z ostatnich 5 meczów
+        df["Average Goals (5)"] = df["Total Goals"].rolling(window=5).mean().fillna(2.5)
+
+        # Obliczamy średnią bramek z ostatnich 30 meczów
+        df["Average Goals (30)"] = df["Total Goals"].rolling(window=30).mean().fillna(2.5)
+
+    # Obliczamy odchylenie pomiędzy średnimi z 5 i 30 meczów
+    df["Deviation"] = abs(df["Average Goals (5)"] - df["Average Goals (30)"])
+
+    # Tworzymy nową kolumnę 'Final Average Goals' bazując na wagi średnich
+    df["Final Average Goals"] = np.where(
+        df["Deviation"] > 0.5,  # Jeśli odchylenie większe niż 0.5
+        (0.7 * df["Average Goals (5)"]) + (0.3 * df["Average Goals (30)"]),  # Większa waga dla window=5
+        (0.3 * df["Average Goals (5)"]) + (0.7 * df["Average Goals (30)"])  # Większa waga dla window=30
+    )
 
     df["Is Over 2.5"] = df["Over 2.5"]
-    df = df.drop(
-        columns=["Home Goals", "Away Goals", "Total Goals", "Over 2.5", "League"])  # Usunięcie kolumny "League"
+    df = df.drop(columns=["Home Goals", "Away Goals", "Total Goals", "Over 2.5", "League",
+                          "Deviation"])  # Usuwamy zbędne kolumny
 
     return df, le
 
@@ -117,7 +134,7 @@ def filter_upcoming_matches(upcoming_matches):
     filtered_matches = upcoming_matches[
         (upcoming_matches["Match Date"] >= today) &
         (upcoming_matches["Match Date"] <= three_days_later)
-    ]
+        ]
 
     return filtered_matches
 
@@ -185,46 +202,81 @@ def fetch_upcoming_matches():
     return filtered_matches
 
 
-def predict_over_2_5(model, upcoming_matches, le):
+def compute_team_averages(historical_data, window):
+    team_avg_goals = {}
+
+    for team in set(historical_data["Home Team"]).union(set(historical_data["Away Team"])):
+
+        # Ostatnie mecze drużyny jako gospodarza
+        home_matches = historical_data[historical_data["Home Team"] == team]["Total Goals"].tail(window)
+
+        # Ostatnie mecze drużyny jako gościa
+        away_matches = historical_data[historical_data["Away Team"] == team]["Total Goals"].tail(window)
+
+        # Liczymy średnią łącznej liczby bramek (strzelone + stracone)
+        avg_goals = pd.concat([home_matches, away_matches]).mean()
+
+        if not np.isnan(avg_goals):
+            team_avg_goals[team] = avg_goals
+        else:
+            # Jeśli brak danych, można przypisać np. średnią z całego zestawu meczów
+            team_avg_goals[team] = historical_data["Total Goals"].mean()
+
+    return team_avg_goals
+
+
+def predict_over_2_5(model, upcoming_matches, le, historical_data):
     print("Przewidywanie wyników dla nadchodzących meczów...")
 
     # Sprawdzenie, które drużyny są nowe
     new_teams = set(upcoming_matches["Home Team"]).union(set(upcoming_matches["Away Team"])) - set(le.classes_)
-
     if new_teams:
-        print(f"Znaleziono nowe drużyny, które nie zostały wcześniej zakodowane: {new_teams}")
-        le.fit(list(le.classes_) + list(new_teams))  # Dodajemy nowe drużyny do LabelEncoder
+        print(f"Znaleziono nowe drużyny: {new_teams}")
+        le.fit(list(le.classes_) + list(new_teams))
 
-    # Kodowanie nazw drużyn na liczby w nadchodzących meczach
+    # Tworzymy kopię danych, aby uniknąć ostrzeżeń o kopii
+    upcoming_matches = upcoming_matches.copy()
+
     upcoming_matches["Home Team"] = le.transform(upcoming_matches["Home Team"])
     upcoming_matches["Away Team"] = le.transform(upcoming_matches["Away Team"])
 
-    # Dodajemy kolumnę "Average Goals" w nadchodzących meczach
-    if 'Average Goals' not in upcoming_matches.columns:
-        print("Kolumna 'Average Goals' nie istnieje. Obliczamy średnią bramek...")
-        upcoming_matches["Average Goals"] = 2.5  # Możesz dostosować ten krok w zależności od danych
+    # Obliczanie średnich bramek na podstawie historycznych danych
+    avg_goals_5 = compute_team_averages(historical_data, 5)
+    avg_goals_30 = compute_team_averages(historical_data, 30)
 
-    # Przygotowanie cech (features) do przewidywania
-    X = upcoming_matches[["Home Team", "Away Team", "Average Goals"]]
+    # Przypisanie średnich bramek tylko drużynom, które mają dane
+    upcoming_matches["Average Goals (5)"] = upcoming_matches["Home Team"].map(avg_goals_5) + upcoming_matches["Away Team"].map(avg_goals_5)
+    upcoming_matches["Average Goals (30)"] = upcoming_matches["Home Team"].map(avg_goals_30) + upcoming_matches["Away Team"].map(avg_goals_30)
 
-    # Przewidywanie na podstawie modelu
+    # Usunięcie meczów, w których którakolwiek drużyna nie ma średniej liczby bramek
+    upcoming_matches = upcoming_matches.dropna(subset=["Average Goals (5)", "Average Goals (30)"])
+
+    # Obliczanie "Deviation" i "Final Average Goals"
+    upcoming_matches.loc[:, "Deviation"] = abs(upcoming_matches["Average Goals (5)"] - upcoming_matches["Average Goals (30)"])
+
+    upcoming_matches.loc[:, "Final Average Goals"] = np.where(
+        upcoming_matches["Deviation"] > 0.5,
+        (0.7 * upcoming_matches["Average Goals (5)"]) + (0.3 * upcoming_matches["Average Goals (30)"]),
+        (0.3 * upcoming_matches["Average Goals (5)"]) + (0.7 * upcoming_matches["Average Goals (30)"])
+    )
+
+    # Przygotowanie cech do modelu
+    X = upcoming_matches[["Home Team", "Away Team", "Average Goals (5)", "Average Goals (30)", "Final Average Goals"]]
+
+    # Przewidywanie Over 2.5
     predictions_proba = model.predict_proba(X)
+    upcoming_matches.loc[:, "Prediction Over 2.5"] = predictions_proba[:, 1] * 100
+    upcoming_matches.loc[:, "Prediction Over 2.5"] = upcoming_matches["Prediction Over 2.5"].round(2).astype(str) + "%"
 
-    # Prawdopodobieństwa dla klasy 1 (Over 2.5)
-    upcoming_matches["Prediction Over 2.5"] = predictions_proba[:, 1] * 100  # Zamiana na procent
+    # Przywrócenie nazw drużyn
+    upcoming_matches.loc[:, "Home Team"] = le.inverse_transform(upcoming_matches["Home Team"])
+    upcoming_matches.loc[:, "Away Team"] = le.inverse_transform(upcoming_matches["Away Team"])
 
-    # Zaokrąglamy do 2 miejsc po przecinku
-    upcoming_matches["Prediction Over 2.5"] = upcoming_matches["Prediction Over 2.5"].round(2).astype(str) + "%"  # Formatowanie jako procent
+    # Dodanie minimalnego kursu
+    upcoming_matches.loc[:, "Minimum Odd"] = (1 / (predictions_proba[:, 1] * 0.88)) + 0.01
+    upcoming_matches.loc[:, "Minimum Odd"] = upcoming_matches["Minimum Odd"].round(2)
 
-    # Przywrócenie nazw drużyn w nadchodzących meczach
-    upcoming_matches["Home Team"] = le.inverse_transform(upcoming_matches["Home Team"])
-    upcoming_matches["Away Team"] = le.inverse_transform(upcoming_matches["Away Team"])
-
-    # Dodanie kolumny z kursem minimalnym
-    upcoming_matches["Minimum Odd"] = (1 / (predictions_proba[:, 1] * 0.88)) + 0.01
-    upcoming_matches["Minimum Odd"] = upcoming_matches["Minimum Odd"].round(2)
-
-    # Zapisujemy wyniki do pliku CSV
+    # Zapis wyników
     upcoming_matches.to_csv("predictions.csv", index=False)
     print("Plik predictions.csv zapisany z przewidywaniami szansy na Over 2.5.")
 
@@ -237,9 +289,12 @@ def main():
     model = train_model(processed_data)
 
     upcoming_matches = fetch_upcoming_matches()
-    predictions = predict_over_2_5(model, upcoming_matches, le)
+    predictions = predict_over_2_5(model, upcoming_matches, le, historical_data)
 
     return predictions
 
 if __name__ == "__main__":
     main()
+
+# DO ZEROBIENIA:
+# funkcja predict_over_2_5 - zweryfikowanei i ustaleniu sposobu obliczania średniej dla 5 i 30 meczów, żeby nie była wprowadzana stała 2.5
